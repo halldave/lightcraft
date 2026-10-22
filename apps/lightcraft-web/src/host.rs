@@ -11,7 +11,8 @@
 //!   clean.
 //! - `lightcraft:dirty` (to the parent): `{ dirty }` whenever the opened photo's edit settings
 //!   differ from those it was opened or last exported with.
-//! - `lightcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+//! - `lightcraft:failed` (to the parent): `{ error }` when the app couldn't start, or when a
+//!   `lightcraft:open` file is over the size cap ([`crate::backup::MAX_BYTES`]).
 //!
 //! Only the parent window on the page's own origin is heard or answered. In host mode the library
 //! lives in memory only (no browser storage, no demo photos, no one-tab lock) and the parent guards
@@ -110,6 +111,7 @@ fn listen(window: &web_sys::Window, parent: web_sys::Window, origin: String) {
         }
         let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Photo.jpg".to_string());
         let Some(bytes) = bytes(&data) else { return };
+        let Ok(bytes) = bytes else { return };
         INBOX.with(|q| q.borrow_mut().push((name, bytes)));
         crate::web::request_repaint();
     });
@@ -131,14 +133,20 @@ fn string(data: &JsValue, key: &str) -> Option<String> {
     js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_string()
 }
 
-/// `bytes` as an `ArrayBuffer` or `Uint8Array`.
-fn bytes(data: &JsValue) -> Option<Vec<u8>> {
+/// `bytes` as an `ArrayBuffer` or `Uint8Array`, copied only when within the size cap; an
+/// oversize file is reported to the parent (`lightcraft:failed`) and yields `Err`.
+fn bytes(data: &JsValue) -> Option<Result<Vec<u8>, ()>> {
     let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
-    if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
-        Some(array.to_vec())
+    let array = if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
+        array.clone()
     } else if bytes.is_instance_of::<js_sys::ArrayBuffer>() {
-        Some(js_sys::Uint8Array::new(&bytes).to_vec())
+        js_sys::Uint8Array::new(&bytes)
     } else {
-        None
+        return None;
+    };
+    if let Some(error) = crate::backup::open_size_error(u64::from(array.byte_length())) {
+        failed(&error);
+        return Some(Err(()));
     }
+    Some(Ok(array.to_vec()))
 }
